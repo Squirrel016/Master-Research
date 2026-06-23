@@ -12,7 +12,13 @@ from torch import nn
 from torch.utils.data import DataLoader, Subset
 
 from baselines import evaluate_baselines, log_baseline_results
-from dataset import CrowdDataset, temporal_train_val_indices
+from dataset import (
+    CrowdDataset,
+    TEST_RATIO,
+    TRAIN_RATIO,
+    VAL_RATIO,
+    temporal_split_indices,
+)
 from model import NUM_STATIONS, CrowdLSTM
 from scaling import (
     POPULATION_SCALER_KEY,
@@ -30,7 +36,6 @@ SCALERS_FILENAME = "scalers.joblib"
 EPOCHS = 50
 BATCH_SIZE = 32
 LEARNING_RATE = 0.001
-TRAIN_RATIO = 0.8
 RANDOM_SEED = 42
 MAPE_EPSILON = 1e-8
 
@@ -208,14 +213,15 @@ def format_hourly_table(df: pd.DataFrame) -> str:
 def log_hourly_stats(
     global_hourly: pd.DataFrame,
     per_station_hourly: dict[int, pd.DataFrame],
+    split_name: str,
 ) -> None:
     print("\n" + "=" * 72)
-    print("GLOBAL HOURLY STATS (all stations, full validation set)")
+    print(f"GLOBAL HOURLY STATS (all stations, {split_name} set)")
     print("=" * 72)
     print(format_hourly_table(global_hourly))
 
     print("\n" + "=" * 72)
-    print("PER-STATION HOURLY STATS (full validation set)")
+    print(f"PER-STATION HOURLY STATS ({split_name} set)")
     print("=" * 72)
     for sid in sorted(per_station_hourly):
         print(f"\n--- {station_label(sid)} ---")
@@ -225,6 +231,7 @@ def log_hourly_stats(
 def plot_hourly_performance_by_station(
     per_station_hourly: dict[int, pd.DataFrame],
     save_path: Path,
+    split_name: str,
 ) -> None:
     plt.figure(figsize=(12, 6))
     colors = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728"]
@@ -245,7 +252,7 @@ def plot_hourly_performance_by_station(
     plt.xticks(HOURS)
     plt.xlabel("Hour of day", fontsize=12)
     plt.ylabel("MAPE (%)", fontsize=12)
-    plt.title("Hourly MAPE by Station (full validation set)", fontsize=13)
+    plt.title(f"Hourly MAPE by Station ({split_name} set)", fontsize=13)
     plt.legend(fontsize=10, loc="best")
     plt.grid(True, alpha=0.3)
     plt.tight_layout()
@@ -253,7 +260,12 @@ def plot_hourly_performance_by_station(
     plt.close()
 
 
-def plot_scatter(preds: np.ndarray, targets: np.ndarray, save_path: Path) -> None:
+def plot_scatter(
+    preds: np.ndarray,
+    targets: np.ndarray,
+    save_path: Path,
+    split_name: str,
+) -> None:
     plt.figure(figsize=(7, 7))
     plt.scatter(targets, preds, alpha=0.45, s=28, edgecolors="none", color="steelblue")
     lo = min(targets.min(), preds.min())
@@ -263,7 +275,7 @@ def plot_scatter(preds: np.ndarray, targets: np.ndarray, save_path: Path) -> Non
     plt.plot(line, line, "r--", linewidth=2, label="y = x")
     plt.xlabel("Actual population", fontsize=12)
     plt.ylabel("Predicted population", fontsize=12)
-    plt.title("Predicted vs Actual Population", fontsize=13)
+    plt.title(f"Predicted vs Actual Population ({split_name} set)", fontsize=13)
     plt.legend(fontsize=11)
     plt.axis("equal")
     plt.grid(True, alpha=0.3)
@@ -290,9 +302,13 @@ def evaluate_validation(
     return overall, per_station, preds, targets, station_ids, hours
 
 
-def log_evaluation_results(overall: Metrics, per_station: dict[int, Metrics]) -> None:
+def log_evaluation_results(
+    overall: Metrics,
+    per_station: dict[int, Metrics],
+    split_name: str,
+) -> None:
     print("\n" + "=" * 50)
-    print("VALIDATION METRICS (real population scale, all samples)")
+    print(f"{split_name.upper()} METRICS (real population scale, all samples)")
     print("=" * 50)
     print_metrics_report("Overall (all stations)", overall)
 
@@ -303,24 +319,24 @@ def log_evaluation_results(overall: Metrics, per_station: dict[int, Metrics]) ->
         print_metrics_report(f"Station: {station_label(sid)} (id={sid})", per_station[sid])
 
 
-def save_run_results_csv(
+def append_split_metrics_rows(
+    rows: list[dict],
+    scope_prefix: str,
     run_id: int,
     seed: int,
     overall: Metrics,
     per_station: dict[int, Metrics],
     global_hourly: pd.DataFrame,
     per_station_hourly: dict[int, pd.DataFrame],
-    best_val_loss: float,
-    output_dir: Path,
+    best_val_loss: str | float = "",
     baseline_overall: dict[str, Metrics] | None = None,
     baseline_per_station: dict[str, dict[int, Metrics]] | None = None,
-) -> Path:
-    """Save all validation metrics for one run into a single CSV file."""
-    output_dir.mkdir(parents=True, exist_ok=True)
-    rows: list[dict] = []
+) -> None:
+    def scope(name: str) -> str:
+        return f"{scope_prefix}_{name}" if scope_prefix else name
 
     def append_metric_row(
-        scope: str,
+        row_scope: str,
         m: Metrics,
         station_id: str | int = "",
         station_name: str = "",
@@ -331,7 +347,7 @@ def save_run_results_csv(
             {
                 "run_id": run_id,
                 "seed": seed,
-                "scope": scope,
+                "scope": row_scope,
                 "station_id": station_id,
                 "station_name": station_name,
                 "hour": hour,
@@ -344,26 +360,26 @@ def save_run_results_csv(
             }
         )
 
-    append_metric_row("overall", overall, loss=best_val_loss)
+    append_metric_row(scope("overall"), overall, loss=best_val_loss)
 
     for sid in sorted(per_station):
         m = per_station[sid]
-        append_metric_row("station", m, station_id=sid, station_name=station_label(sid))
+        append_metric_row(scope("station"), m, station_id=sid, station_name=station_label(sid))
 
     if baseline_overall and baseline_per_station:
         for baseline_key in ("persistence", "seasonal_naive"):
-            scope = f"baseline_{baseline_key}"
-            append_metric_row(scope, baseline_overall[baseline_key])
+            row_scope = scope(f"baseline_{baseline_key}")
+            append_metric_row(row_scope, baseline_overall[baseline_key])
             for sid in sorted(baseline_per_station[baseline_key]):
                 m = baseline_per_station[baseline_key][sid]
-                append_metric_row(scope, m, station_id=sid, station_name=station_label(sid))
+                append_metric_row(row_scope, m, station_id=sid, station_name=station_label(sid))
 
     for _, row in global_hourly.iterrows():
         rows.append(
             {
                 "run_id": run_id,
                 "seed": seed,
-                "scope": "global_hourly",
+                "scope": scope("global_hourly"),
                 "station_id": "",
                 "station_name": "",
                 "hour": int(row["hour"]),
@@ -382,7 +398,7 @@ def save_run_results_csv(
                 {
                     "run_id": run_id,
                     "seed": seed,
-                    "scope": "station_hourly",
+                    "scope": scope("station_hourly"),
                     "station_id": sid,
                     "station_name": station_label(sid),
                     "hour": int(row["hour"]),
@@ -395,6 +411,58 @@ def save_run_results_csv(
                 }
             )
 
+
+def save_run_results_csv(
+    run_id: int,
+    seed: int,
+    test_overall: Metrics,
+    test_per_station: dict[int, Metrics],
+    test_global_hourly: pd.DataFrame,
+    test_per_station_hourly: dict[int, pd.DataFrame],
+    best_val_loss: float,
+    output_dir: Path,
+    val_overall: Metrics | None = None,
+    val_per_station: dict[int, Metrics] | None = None,
+    val_global_hourly: pd.DataFrame | None = None,
+    val_per_station_hourly: dict[int, pd.DataFrame] | None = None,
+    test_baseline_overall: dict[str, Metrics] | None = None,
+    test_baseline_per_station: dict[str, dict[int, Metrics]] | None = None,
+    val_baseline_overall: dict[str, Metrics] | None = None,
+    val_baseline_per_station: dict[str, dict[int, Metrics]] | None = None,
+) -> Path:
+    """Save test (primary) and val metrics for one run into a single CSV file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    rows: list[dict] = []
+
+    append_split_metrics_rows(
+        rows,
+        "",
+        run_id,
+        seed,
+        test_overall,
+        test_per_station,
+        test_global_hourly,
+        test_per_station_hourly,
+        best_val_loss=best_val_loss,
+        baseline_overall=test_baseline_overall,
+        baseline_per_station=test_baseline_per_station,
+    )
+
+    if val_overall is not None and val_per_station is not None:
+        assert val_global_hourly is not None and val_per_station_hourly is not None
+        append_split_metrics_rows(
+            rows,
+            "val",
+            run_id,
+            seed,
+            val_overall,
+            val_per_station,
+            val_global_hourly,
+            val_per_station_hourly,
+            baseline_overall=val_baseline_overall,
+            baseline_per_station=val_baseline_per_station,
+        )
+
     out_path = output_dir / f"result_run_{run_id}.csv"
     pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
     return out_path
@@ -402,15 +470,17 @@ def save_run_results_csv(
 
 def run_full_evaluation(
     model: CrowdLSTM,
-    val_loader: DataLoader,
+    loader: DataLoader,
     scaler: MinMaxScaler,
     device: torch.device,
     output_dir: Path,
+    split_name: str,
+    save_plots: bool = True,
 ) -> tuple[Metrics, dict[int, Metrics], pd.DataFrame, dict[int, pd.DataFrame], np.ndarray, np.ndarray]:
     overall, per_station, preds, targets, station_ids, hours = evaluate_validation(
-        model, val_loader, scaler, device
+        model, loader, scaler, device
     )
-    log_evaluation_results(overall, per_station)
+    log_evaluation_results(overall, per_station, split_name)
 
     global_hourly = compute_hourly_stats(preds, targets, hours)
     per_station_hourly: dict[int, pd.DataFrame] = {}
@@ -419,16 +489,17 @@ def run_full_evaluation(
             preds, targets, hours, station_id=sid, station_ids=station_ids
         )
 
-    log_hourly_stats(global_hourly, per_station_hourly)
+    log_hourly_stats(global_hourly, per_station_hourly, split_name)
 
-    scatter_path = output_dir / "eval_scatter.png"
-    hourly_path = output_dir / "hourly_performance_by_station.png"
-    plot_hourly_performance_by_station(per_station_hourly, hourly_path)
-    plot_scatter(preds, targets, scatter_path)
+    if save_plots:
+        scatter_path = output_dir / f"eval_scatter_{split_name}.png"
+        hourly_path = output_dir / f"hourly_performance_by_station_{split_name}.png"
+        plot_hourly_performance_by_station(per_station_hourly, hourly_path, split_name)
+        plot_scatter(preds, targets, scatter_path, split_name)
+        print("\nEvaluation figures saved:")
+        print(f"  {hourly_path}")
+        print(f"  {scatter_path}")
 
-    print("\nEvaluation figures saved:")
-    print(f"  {hourly_path}")
-    print(f"  {scatter_path}")
     return overall, per_station, global_hourly, per_station_hourly, preds, targets
 
 
@@ -453,26 +524,77 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
-def log_temporal_split(dataset: CrowdDataset, train_indices: list[int], val_indices: list[int]) -> None:
-    """Print per-station train/val time ranges for the temporal split."""
-    train_idx = np.array(train_indices, dtype=int)
-    val_idx = np.array(val_indices, dtype=int)
+def log_temporal_split(
+    dataset: CrowdDataset,
+    train_indices: list[int],
+    val_indices: list[int],
+    test_indices: list[int],
+) -> None:
+    """Print per-station time ranges for the temporal train/val/test split."""
+    split_map = {
+        "train": np.array(train_indices, dtype=int),
+        "val": np.array(val_indices, dtype=int),
+        "test": np.array(test_indices, dtype=int),
+    }
 
-    print("\nTemporal train/val split (per station, earlier -> train, later -> val)")
-    print("-" * 72)
+    print(
+        f"\nTemporal split (per station, chronological): "
+        f"train {TRAIN_RATIO:.0%} | val {VAL_RATIO:.0%} | test {TEST_RATIO:.0%}"
+    )
+    print("-" * 96)
     for sid in sorted(np.unique(dataset._station_ids)):
-        train_mask = dataset._station_ids[train_idx] == sid
-        val_mask = dataset._station_ids[val_idx] == sid
-        train_t = pd.to_datetime(dataset._target_datetimes[train_idx[train_mask]])
-        val_t = pd.to_datetime(dataset._target_datetimes[val_idx[val_mask]])
-        if len(train_t) == 0 or len(val_t) == 0:
-            continue
         name = station_label(int(sid))
-        print(
-            f"  {name:12s} | train: {train_t.min()} -> {train_t.max()} ({len(train_t):4d})"
-            f" | val: {val_t.min()} -> {val_t.max()} ({len(val_t):4d})"
-        )
-    print("-" * 72)
+        parts: list[str] = []
+        for split_name, idx in split_map.items():
+            mask = dataset._station_ids[idx] == sid
+            times = pd.to_datetime(dataset._target_datetimes[idx[mask]])
+            if len(times) == 0:
+                continue
+            parts.append(
+                f"{split_name}: {times.min()} -> {times.max()} ({len(times):4d})"
+            )
+        print(f"  {name:12s} | " + " | ".join(parts))
+    print("-" * 96)
+
+
+def save_split_manifest(
+    dataset: CrowdDataset,
+    train_indices: list[int],
+    val_indices: list[int],
+    test_indices: list[int],
+    output_dir: Path,
+) -> Path:
+    """Persist per-station split boundaries for reproducibility."""
+    rows: list[dict] = []
+    split_map = {
+        "train": train_indices,
+        "val": val_indices,
+        "test": test_indices,
+    }
+    for split_name, indices in split_map.items():
+        idx = np.array(indices, dtype=int)
+        for sid in sorted(np.unique(dataset._station_ids)):
+            mask = dataset._station_ids[idx] == sid
+            times = pd.to_datetime(dataset._target_datetimes[idx[mask]])
+            if len(times) == 0:
+                continue
+            rows.append(
+                {
+                    "split": split_name,
+                    "station_id": int(sid),
+                    "station_name": station_label(int(sid)),
+                    "n_samples": int(mask.sum()),
+                    "start_datetime": times.min(),
+                    "end_datetime": times.max(),
+                    "train_ratio": TRAIN_RATIO,
+                    "val_ratio": VAL_RATIO,
+                    "test_ratio": TEST_RATIO,
+                }
+            )
+
+    out_path = output_dir / "split_manifest.csv"
+    pd.DataFrame(rows).to_csv(out_path, index=False, encoding="utf-8-sig")
+    return out_path
 
 
 def main() -> None:
@@ -492,15 +614,24 @@ def main() -> None:
     dataset = CrowdDataset(DATA_PATH)
     print(f"Valid samples after is_fake filtering: {len(dataset)}")
 
-    train_indices, val_indices = temporal_train_val_indices(dataset, TRAIN_RATIO)
+    train_indices, val_indices, test_indices = temporal_split_indices(dataset)
     population_scaler = prepare_dataset_scaler(dataset, train_indices, output_dir)
     train_set = Subset(dataset, train_indices)
     val_set = Subset(dataset, val_indices)
-    log_temporal_split(dataset, train_indices, val_indices)
-    print(f"Train samples: {len(train_set)} | Val samples: {len(val_set)}")
+    test_set = Subset(dataset, test_indices)
+    log_temporal_split(dataset, train_indices, val_indices, test_indices)
+    manifest_path = save_split_manifest(
+        dataset, train_indices, val_indices, test_indices, output_dir
+    )
+    print(f"Split manifest saved to {manifest_path}")
+    print(
+        f"Train samples: {len(train_set)} | Val samples: {len(val_set)} | "
+        f"Test samples: {len(test_set)}"
+    )
 
     train_loader = DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True)
     val_loader = DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False)
+    test_loader = DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False)
 
     model = CrowdLSTM(num_stations=NUM_STATIONS).to(device)
     criterion = nn.HuberLoss()
@@ -525,25 +656,49 @@ def main() -> None:
     print(f"Model saved to {BEST_MODEL_PATH}")
 
     model.load_state_dict(torch.load(BEST_MODEL_PATH, weights_only=True))
-    overall, per_station, global_hourly, per_station_hourly, _, _ = run_full_evaluation(
-        model, val_loader, population_scaler, device, output_dir
+
+    val_overall, val_per_station, val_global_hourly, val_per_station_hourly, _, _ = (
+        run_full_evaluation(
+            model, val_loader, population_scaler, device, output_dir, "val", save_plots=False
+        )
+    )
+    test_overall, test_per_station, test_global_hourly, test_per_station_hourly, _, _ = (
+        run_full_evaluation(
+            model, test_loader, population_scaler, device, output_dir, "test", save_plots=True
+        )
     )
 
-    baseline_overall, baseline_per_station = evaluate_baselines(dataset, val_indices)
-    log_baseline_results(baseline_overall, baseline_per_station)
+    val_baseline_overall, val_baseline_per_station = evaluate_baselines(dataset, val_indices)
+    test_baseline_overall, test_baseline_per_station = evaluate_baselines(dataset, test_indices)
+
+    print("\n" + "=" * 50)
+    print("SIMPLE BASELINES (val set, raw population scale)")
+    print("=" * 50)
+    log_baseline_results(val_baseline_overall, val_baseline_per_station)
+
+    print("\n" + "=" * 50)
+    print("SIMPLE BASELINES (test set, raw population scale)")
+    print("=" * 50)
+    log_baseline_results(test_baseline_overall, test_baseline_per_station)
 
     if args.run_id is not None:
         csv_path = save_run_results_csv(
             args.run_id,
             seed,
-            overall,
-            per_station,
-            global_hourly,
-            per_station_hourly,
+            test_overall,
+            test_per_station,
+            test_global_hourly,
+            test_per_station_hourly,
             best_val_loss,
             output_dir,
-            baseline_overall=baseline_overall,
-            baseline_per_station=baseline_per_station,
+            val_overall=val_overall,
+            val_per_station=val_per_station,
+            val_global_hourly=val_global_hourly,
+            val_per_station_hourly=val_per_station_hourly,
+            test_baseline_overall=test_baseline_overall,
+            test_baseline_per_station=test_baseline_per_station,
+            val_baseline_overall=val_baseline_overall,
+            val_baseline_per_station=val_baseline_per_station,
         )
         print(f"\nRun metrics saved to {csv_path}")
 

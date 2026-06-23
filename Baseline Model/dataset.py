@@ -15,6 +15,11 @@ SEQ_FEATURE_DIM = 1 + TIME_FEATURE_DIM  # population + cyclic time features
 TARGET_COL = "population"
 DEFAULT_DATA_PATH = Path(__file__).parent / "processed_data.csv"
 
+# Temporal split ratios (must sum to 1.0). Applied per station, earliest -> latest.
+TRAIN_RATIO = 0.70
+VAL_RATIO = 0.15
+TEST_RATIO = 0.15
+
 
 def build_model_features(raw_features: np.ndarray) -> np.ndarray:
     """Convert raw CSV columns to model input: population + sin/cos time encodings."""
@@ -130,31 +135,61 @@ class CrowdDataset(Dataset):
         return self._target_datetimes[idx]
 
 
-def temporal_train_val_indices(
+def temporal_split_indices(
     dataset: CrowdDataset,
-    train_ratio: float = 0.8,
-) -> tuple[list[int], list[int]]:
+    train_ratio: float = TRAIN_RATIO,
+    val_ratio: float = VAL_RATIO,
+    test_ratio: float = TEST_RATIO,
+) -> tuple[list[int], list[int], list[int]]:
     """
-    Split samples by time within each station: earlier windows -> train, later -> val.
+    Split samples by time within each station: train -> val -> test (chronological).
+
+    Default 70/15/15: train for fitting, val for model selection, test for final eval.
     """
+    if not np.isclose(train_ratio + val_ratio + test_ratio, 1.0):
+        raise ValueError(
+            f"Split ratios must sum to 1.0, got "
+            f"{train_ratio + val_ratio + test_ratio:.4f}"
+        )
+
     train_indices: list[int] = []
     val_indices: list[int] = []
+    test_indices: list[int] = []
 
     for sid in np.unique(dataset._station_ids):
         station_idx = np.where(dataset._station_ids == sid)[0]
         order = station_idx[np.argsort(dataset._target_datetimes[station_idx])]
-        split_at = int(len(order) * train_ratio)
+        n = len(order)
 
-        if split_at <= 0 or split_at >= len(order):
+        if n < 3:
             raise ValueError(
-                f"Invalid temporal split for station {sid}: "
-                f"{len(order)} samples, train_ratio={train_ratio}"
+                f"Station {sid} has only {n} samples; need at least 3 for train/val/test."
             )
 
-        train_indices.extend(order[:split_at].tolist())
-        val_indices.extend(order[split_at:].tolist())
+        train_end = int(n * train_ratio)
+        val_end = int(n * (train_ratio + val_ratio))
 
-    return train_indices, val_indices
+        train_end = max(1, min(train_end, n - 2))
+        val_end = max(train_end + 1, min(val_end, n - 1))
+
+        train_indices.extend(order[:train_end].tolist())
+        val_indices.extend(order[train_end:val_end].tolist())
+        test_indices.extend(order[val_end:].tolist())
+
+    return train_indices, val_indices, test_indices
+
+
+def temporal_train_val_indices(
+    dataset: CrowdDataset,
+    train_ratio: float = 0.8,
+) -> tuple[list[int], list[int]]:
+    """Deprecated: use temporal_split_indices(). Kept for backward compatibility."""
+    val_ratio = (1.0 - train_ratio) / 2.0
+    test_ratio = (1.0 - train_ratio) / 2.0
+    train_indices, val_indices, test_indices = temporal_split_indices(
+        dataset, train_ratio, val_ratio, test_ratio
+    )
+    return train_indices, val_indices + test_indices
 
 
 def create_dataloader(

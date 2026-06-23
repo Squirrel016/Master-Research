@@ -11,6 +11,8 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from dataset import TEST_RATIO, TRAIN_RATIO, VAL_RATIO
+
 PROJECT_DIR = Path(__file__).parent
 TRAIN_SCRIPT = PROJECT_DIR / "train.py"
 
@@ -82,8 +84,8 @@ def format_pm(mean: float, std: float, decimals: int = 2, pct: bool = False) -> 
     return f"{mean:.{decimals}f} +/- {std:.{decimals}f}{suffix}"
 
 
-def aggregate_overall(df: pd.DataFrame) -> pd.DataFrame:
-    sub = df[df["scope"] == "overall"]
+def aggregate_overall(df: pd.DataFrame, scope: str = "overall") -> pd.DataFrame:
+    sub = df[df["scope"] == scope]
     rows = []
     for metric in METRIC_COLS_OVERALL:
         m, s = mean_std(sub[metric])
@@ -91,8 +93,8 @@ def aggregate_overall(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def aggregate_per_station(df: pd.DataFrame) -> pd.DataFrame:
-    sub = df[df["scope"] == "station"]
+def aggregate_per_station(df: pd.DataFrame, scope: str = "station") -> pd.DataFrame:
+    sub = df[df["scope"] == scope]
     rows = []
     for name in STATION_NAMES:
         station_df = sub[sub["station_name"] == name]
@@ -143,12 +145,21 @@ def _is_overall_row(df: pd.DataFrame) -> pd.Series:
     return df["station_name"].isna() | (df["station_name"].astype(str).str.strip() == "")
 
 
-def aggregate_model_comparison(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_model_comparison(df: pd.DataFrame, scope_suffix: str = "") -> pd.DataFrame:
     """Aggregate overall metrics for LSTM and simple baselines across runs."""
+    overall_scope = "overall" if not scope_suffix else f"{scope_suffix}_overall"
+    baseline_persistence = (
+        "baseline_persistence" if not scope_suffix else f"{scope_suffix}_baseline_persistence"
+    )
+    baseline_seasonal = (
+        "baseline_seasonal_naive"
+        if not scope_suffix
+        else f"{scope_suffix}_baseline_seasonal_naive"
+    )
     model_specs = [
-        ("CrowdLSTM", "overall"),
-        ("Persistence (t-1)", "baseline_persistence"),
-        ("Seasonal Naive (t-24)", "baseline_seasonal_naive"),
+        ("CrowdLSTM", overall_scope),
+        ("Persistence (t-1)", baseline_persistence),
+        ("Seasonal Naive (t-24)", baseline_seasonal),
     ]
     rows: list[dict] = []
     for model_name, scope in model_specs:
@@ -164,13 +175,22 @@ def aggregate_model_comparison(df: pd.DataFrame) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def aggregate_baseline_per_station(df: pd.DataFrame) -> pd.DataFrame:
+def aggregate_baseline_per_station(df: pd.DataFrame, scope_suffix: str = "") -> pd.DataFrame:
     """Per-station MAE/RMSE/MAPE for LSTM vs baselines."""
+    station_scope = "station" if not scope_suffix else f"{scope_suffix}_station"
+    baseline_persistence = (
+        "baseline_persistence" if not scope_suffix else f"{scope_suffix}_baseline_persistence"
+    )
+    baseline_seasonal = (
+        "baseline_seasonal_naive"
+        if not scope_suffix
+        else f"{scope_suffix}_baseline_seasonal_naive"
+    )
     rows: list[dict] = []
     specs = [
-        ("CrowdLSTM", "station"),
-        ("Persistence (t-1)", "baseline_persistence"),
-        ("Seasonal Naive (t-24)", "baseline_seasonal_naive"),
+        ("CrowdLSTM", station_scope),
+        ("Persistence (t-1)", baseline_persistence),
+        ("Seasonal Naive (t-24)", baseline_seasonal),
     ]
     for station in STATION_NAMES:
         for model_name, scope in specs:
@@ -193,6 +213,8 @@ def build_report(
     station_hourly_aggs: dict[str, pd.DataFrame],
     model_comparison_agg: pd.DataFrame,
     baseline_station_agg: pd.DataFrame,
+    val_overall_agg: pd.DataFrame,
+    val_model_comparison_agg: pd.DataFrame,
     result_dir: Path,
 ) -> str:
     lines: list[str] = []
@@ -205,10 +227,13 @@ def build_report(
 
     lines.append("EXPERIMENT REPORT (CrowdLSTM + Simple Baselines)")
     lines.append(f"Runs: {len(SEEDS)} | Seeds: {', '.join(map(str, SEEDS))}")
+    lines.append(
+        f"Temporal split: train {TRAIN_RATIO:.0%} | val {VAL_RATIO:.0%} | test {TEST_RATIO:.0%}"
+    )
     lines.append(f"Output directory: {result_dir.resolve()}")
     lines.append("=" * w)
 
-    section("1. MODEL COMPARISON (Mean +/- Std, validation set)")
+    section("1. MODEL COMPARISON (Mean +/- Std, held-out test set)")
     header = (
         f"  {'Model':<22} | {'MAE':>18} | {'RMSE':>18} | "
         f"{'MAPE':>18} | {'R^2':>14}"
@@ -224,7 +249,7 @@ def build_report(
             f"{format_pm(row['r2_mean'], row['r2_std'], decimals=4):>14}"
         )
 
-    section("2. CROWDLSTM OVERALL METRICS (Mean +/- Std)")
+    section("2. CROWDLSTM TEST SET METRICS (Mean +/- Std)")
     for _, row in overall_agg.iterrows():
         pct = row["metric"] == "mape"
         dec = 4 if row["metric"] == "r2" else 2
@@ -233,7 +258,7 @@ def build_report(
             f"{format_pm(row['mean'], row['std'], decimals=dec, pct=pct)}"
         )
 
-    section("3. CROWDLSTM PER-STATION METRICS (Mean +/- Std)")
+    section("3. CROWDLSTM PER-STATION TEST METRICS (Mean +/- Std)")
     for station in STATION_NAMES:
         lines.append(f"\n  [{station}]")
         sub = station_agg[station_agg["station"] == station]
@@ -245,7 +270,7 @@ def build_report(
                 f"{format_pm(row['mean'], row['std'], decimals=dec, pct=pct)}"
             )
 
-    section("4. BASELINE vs LSTM BY STATION (MAE / RMSE / MAPE, Mean +/- Std)")
+    section("4. BASELINE vs LSTM BY STATION — TEST SET (MAE / RMSE / MAPE, Mean +/- Std)")
     for station in STATION_NAMES:
         sub = baseline_station_agg[baseline_station_agg["station"] == station]
         if sub.empty:
@@ -262,7 +287,7 @@ def build_report(
                 f"{format_pm(row['mape_mean'], row['mape_std'], pct=True):>18}"
             )
 
-    section("5. GLOBAL HOURLY METRICS - CrowdLSTM (Mean +/- Std)")
+    section("5. GLOBAL HOURLY METRICS - CrowdLSTM TEST SET (Mean +/- Std)")
     header = f"{'Hour':>4} | {'MAE':>18} | {'RMSE':>18} | {'MAPE':>18}"
     lines.append(header)
     lines.append("-" * len(header))
@@ -275,7 +300,7 @@ def build_report(
             f"{format_pm(row['mape_mean'], row['mape_std'], pct=True):>18}"
         )
 
-    section("6. PER-STATION HOURLY METRICS - CrowdLSTM (Mean +/- Std)")
+    section("6. PER-STATION HOURLY METRICS - CrowdLSTM TEST SET (Mean +/- Std)")
     for station in STATION_NAMES:
         lines.append(f"\n  [{station}]")
         hourly = station_hourly_aggs[station]
@@ -290,6 +315,31 @@ def build_report(
                 f"{format_pm(row['rmse_mean'], row['rmse_std']):>18} | "
                 f"{format_pm(row['mape_mean'], row['mape_std'], pct=True):>18}"
             )
+
+    section("7. VALIDATION SET SUMMARY (model selection, Mean +/- Std)")
+    lines.append("  CrowdLSTM overall:")
+    for _, row in val_overall_agg.iterrows():
+        pct = row["metric"] == "mape"
+        dec = 4 if row["metric"] == "r2" else 2
+        lines.append(
+            f"    {row['metric'].upper():6s}: "
+            f"{format_pm(row['mean'], row['std'], decimals=dec, pct=pct)}"
+        )
+    lines.append("")
+    header = (
+        f"  {'Model':<22} | {'MAE':>18} | {'RMSE':>18} | "
+        f"{'MAPE':>18} | {'R^2':>14}"
+    )
+    lines.append(header)
+    lines.append("  " + "-" * (len(header) - 2))
+    for _, row in val_model_comparison_agg.iterrows():
+        lines.append(
+            f"  {row['model']:<22} | "
+            f"{format_pm(row['mae_mean'], row['mae_std']):>18} | "
+            f"{format_pm(row['rmse_mean'], row['rmse_std']):>18} | "
+            f"{format_pm(row['mape_mean'], row['mape_std'], pct=True):>18} | "
+            f"{format_pm(row['r2_mean'], row['r2_std'], decimals=4):>14}"
+        )
 
     lines.append("")
     lines.append("=" * w)
@@ -348,7 +398,7 @@ def plot_hourly_mape(
     ax.set_xticks(HOURS)
     ax.set_xlabel("Hour of day", fontsize=13)
     ax.set_ylabel("MAPE (%)", fontsize=13)
-    ax.set_title("Hourly MAPE: Overall vs Stations (Mean +/- Std over runs)", fontsize=14)
+    ax.set_title("Hourly MAPE: Overall vs Stations (test set, Mean +/- Std over runs)", fontsize=14)
     ax.legend(fontsize=10, loc="best")
     ax.grid(True, alpha=0.35)
     fig.tight_layout()
@@ -408,14 +458,20 @@ def save_aggregate_csv(
     model_comparison_agg: pd.DataFrame,
     baseline_station_agg: pd.DataFrame,
     path: Path,
+    val_overall_agg: pd.DataFrame | None = None,
+    val_model_comparison_agg: pd.DataFrame | None = None,
 ) -> None:
     parts = [
-        overall_agg.assign(section="overall"),
-        station_agg.assign(section="per_station"),
-        global_hourly_agg.assign(section="global_hourly"),
-        model_comparison_agg.assign(section="model_comparison"),
-        baseline_station_agg.assign(section="baseline_by_station"),
+        overall_agg.assign(section="test_overall"),
+        station_agg.assign(section="test_per_station"),
+        global_hourly_agg.assign(section="test_global_hourly"),
+        model_comparison_agg.assign(section="test_model_comparison"),
+        baseline_station_agg.assign(section="test_baseline_by_station"),
     ]
+    if val_overall_agg is not None:
+        parts.append(val_overall_agg.assign(section="val_overall"))
+    if val_model_comparison_agg is not None:
+        parts.append(val_model_comparison_agg.assign(section="val_model_comparison"))
     for station, hourly in station_hourly_aggs.items():
         parts.append(hourly.assign(section=f"hourly_{station}"))
     pd.concat(parts, ignore_index=True).to_csv(path, index=False, encoding="utf-8-sig")
@@ -435,8 +491,8 @@ def main() -> None:
 
     runs_df = load_all_runs(result_dir)
 
-    overall_agg = aggregate_overall(runs_df)
-    station_agg = aggregate_per_station(runs_df)
+    overall_agg = aggregate_overall(runs_df, scope="overall")
+    station_agg = aggregate_per_station(runs_df, scope="station")
     global_hourly_agg = aggregate_hourly(runs_df, "global_hourly")
     station_hourly_aggs = {
         name: aggregate_hourly(runs_df, "station_hourly", station_name=name) for name in STATION_NAMES
@@ -449,6 +505,8 @@ def main() -> None:
 
     model_comparison_agg = aggregate_model_comparison(runs_df)
     baseline_station_agg = aggregate_baseline_per_station(runs_df)
+    val_overall_agg = aggregate_overall(runs_df, scope="val_overall")
+    val_model_comparison_agg = aggregate_model_comparison(runs_df, scope_suffix="val")
 
     report = build_report(
         overall_agg,
@@ -457,6 +515,8 @@ def main() -> None:
         station_hourly_aggs,
         model_comparison_agg,
         baseline_station_agg,
+        val_overall_agg,
+        val_model_comparison_agg,
         result_dir,
     )
     print("\n" + report)
@@ -469,6 +529,8 @@ def main() -> None:
         model_comparison_agg,
         baseline_station_agg,
         aggregate_csv,
+        val_overall_agg=val_overall_agg,
+        val_model_comparison_agg=val_model_comparison_agg,
     )
 
     plot_hourly_mape(global_hourly_agg, station_hourly_aggs, hourly_mape_plot)
