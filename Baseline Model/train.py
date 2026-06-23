@@ -120,16 +120,16 @@ def run_epoch(
     model.train(is_train)
     total_loss = 0.0
 
-    for x_seq, station_id, current_hour, y in loader:
+    for x_seq, station_id, current_time, y, _target_hour in loader:
         x_seq = x_seq.to(device)
         station_id = station_id.to(device)
-        current_hour = current_hour.to(device)
+        current_time = current_time.to(device)
         y = y.to(device)
 
         if is_train:
             optimizer.zero_grad()
 
-        pred = model(x_seq, station_id, current_hour)
+        pred = model(x_seq, station_id, current_time)
         loss = criterion(pred, y)
 
         if is_train:
@@ -151,16 +151,16 @@ def collect_predictions(
     model.eval()
     preds, targets, station_ids, hours = [], [], [], []
 
-    for x_seq, station_id, current_hour, y in loader:
+    for x_seq, station_id, current_time, y, target_hour in loader:
         x_seq = x_seq.to(device)
         station_id = station_id.to(device)
-        current_hour = current_hour.to(device)
+        current_time = current_time.to(device)
 
-        pred = model(x_seq, station_id, current_hour).cpu().numpy()
+        pred = model(x_seq, station_id, current_time).cpu().numpy()
         preds.append(pred)
         targets.append(y.numpy())
         station_ids.append(station_id.cpu().numpy())
-        hours.append(current_hour[:, 0].cpu().numpy().astype(int))
+        hours.append(target_hour.numpy().astype(int))
 
     preds = inverse_population(scaler, np.concatenate(preds))
     targets = inverse_population(scaler, np.concatenate(targets))

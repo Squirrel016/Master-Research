@@ -7,11 +7,20 @@ from sklearn.preprocessing import MinMaxScaler
 from torch.utils.data import DataLoader, Dataset
 
 from scaling import transform_population
+from time_encoding import TIME_FEATURE_DIM, encode_time_features
 
 WINDOW_SIZE = 24
-SEQ_FEATURE_COLS = ["population", "hour_of_day", "day_of_week"]
+RAW_FEATURE_COLS = ["population", "hour_of_day", "day_of_week"]
+SEQ_FEATURE_DIM = 1 + TIME_FEATURE_DIM  # population + cyclic time features
 TARGET_COL = "population"
 DEFAULT_DATA_PATH = Path(__file__).parent / "processed_data.csv"
+
+
+def build_model_features(raw_features: np.ndarray) -> np.ndarray:
+    """Convert raw CSV columns to model input: population + sin/cos time encodings."""
+    population = raw_features[:, 0:1]
+    time_enc = encode_time_features(raw_features[:, 1], raw_features[:, 2])
+    return np.concatenate([population, time_enc], axis=1).astype(np.float32)
 
 
 class CrowdDataset(Dataset):
@@ -27,14 +36,16 @@ class CrowdDataset(Dataset):
 
         seq_list: list[np.ndarray] = []
         station_ids: list[int] = []
-        current_hours: list[np.ndarray] = []
+        current_time_enc: list[np.ndarray] = []
+        target_hours: list[int] = []
         targets_list: list[float] = []
         datetimes_list: list[np.ndarray] = []
         was_missing_list: list[np.ndarray] = []
 
         for _, station_df in df.groupby("station_name", sort=False):
             station_df = station_df.sort_values("datetime").reset_index(drop=True)
-            seq_features = station_df[SEQ_FEATURE_COLS].to_numpy(dtype=np.float32)
+            raw_features = station_df[RAW_FEATURE_COLS].to_numpy(dtype=np.float32)
+            seq_features = build_model_features(raw_features)
             is_fake = station_df["is_fake"].to_numpy()
             was_missing = station_df["was_missing"].to_numpy()
             station_id = int(station_df["station_name"].iloc[0])
@@ -54,7 +65,8 @@ class CrowdDataset(Dataset):
 
                 seq_list.append(seq_features[start:end])
                 station_ids.append(station_id)
-                current_hours.append(seq_features[end, 1:3])
+                current_time_enc.append(seq_features[end, 1:])
+                target_hours.append(int(raw_features[end, 1]))
                 targets_list.append(targets[end])
                 datetimes_list.append(datetimes[window_slice])
                 was_missing_list.append(was_missing[window_slice])
@@ -64,7 +76,8 @@ class CrowdDataset(Dataset):
 
         self._seq = np.stack(seq_list)
         self._station_ids = np.array(station_ids, dtype=np.int64)
-        self._current_hours = np.stack(current_hours)
+        self._current_time_enc = np.stack(current_time_enc)
+        self._target_hours = np.array(target_hours, dtype=np.int64)
         self._targets = np.array(targets_list, dtype=np.float32)
         self._datetimes = datetimes_list
         self._was_missing = was_missing_list
@@ -87,15 +100,18 @@ class CrowdDataset(Dataset):
     def __len__(self) -> int:
         return len(self._targets)
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def __getitem__(
+        self, idx: int
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         seq = self._seq[idx]
         target = float(self._targets[idx])
         seq, target = self._scale_population(seq, target)
         return (
             torch.from_numpy(seq),
             torch.tensor(self._station_ids[idx], dtype=torch.long),
-            torch.from_numpy(self._current_hours[idx]),
+            torch.from_numpy(self._current_time_enc[idx]),
             torch.tensor(target, dtype=torch.float32),
+            torch.tensor(self._target_hours[idx], dtype=torch.long),
         )
 
     def get_datetimes(self, idx: int) -> np.ndarray:
@@ -108,7 +124,7 @@ class CrowdDataset(Dataset):
         return int(self._station_ids[idx])
 
     def get_target_hour(self, idx: int) -> int:
-        return int(self._current_hours[idx][0])
+        return int(self._target_hours[idx])
 
     def get_target_datetime(self, idx: int) -> np.datetime64:
         return self._target_datetimes[idx]
