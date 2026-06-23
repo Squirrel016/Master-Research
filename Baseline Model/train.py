@@ -11,7 +11,7 @@ from sklearn.preprocessing import MinMaxScaler
 from torch import nn
 from torch.utils.data import DataLoader, Subset
 
-from baselines import evaluate_baselines, log_baseline_results
+from baselines import BASELINE_KEYS, evaluate_baselines, log_baseline_results
 from dataset import (
     CrowdDataset,
     TEST_RATIO,
@@ -367,7 +367,7 @@ def append_split_metrics_rows(
         append_metric_row(scope("station"), m, station_id=sid, station_name=station_label(sid))
 
     if baseline_overall and baseline_per_station:
-        for baseline_key in ("persistence", "seasonal_naive"):
+        for baseline_key in BASELINE_KEYS:
             row_scope = scope(f"baseline_{baseline_key}")
             append_metric_row(row_scope, baseline_overall[baseline_key])
             for sid in sorted(baseline_per_station[baseline_key]):
@@ -668,18 +668,22 @@ def main() -> None:
         )
     )
 
-    val_baseline_overall, val_baseline_per_station = evaluate_baselines(dataset, val_indices)
-    test_baseline_overall, test_baseline_per_station = evaluate_baselines(dataset, test_indices)
+    val_baseline_overall, val_baseline_per_station = evaluate_baselines(
+        dataset, val_indices, train_indices, seed=seed
+    )
+    test_baseline_overall, test_baseline_per_station = evaluate_baselines(
+        dataset, test_indices, train_indices, seed=seed
+    )
 
     print("\n" + "=" * 50)
-    print("SIMPLE BASELINES (val set, raw population scale)")
+    print("BASELINES (val set, raw population scale)")
     print("=" * 50)
-    log_baseline_results(val_baseline_overall, val_baseline_per_station)
+    log_baseline_results(val_baseline_overall, val_baseline_per_station, "val")
 
     print("\n" + "=" * 50)
-    print("SIMPLE BASELINES (test set, raw population scale)")
+    print("BASELINES (test set, raw population scale)")
     print("=" * 50)
-    log_baseline_results(test_baseline_overall, test_baseline_per_station)
+    log_baseline_results(test_baseline_overall, test_baseline_per_station, "test")
 
     if args.run_id is not None:
         csv_path = save_run_results_csv(

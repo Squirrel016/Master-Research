@@ -11,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from baselines import get_baseline_per_station_specs, get_model_comparison_specs
 from dataset import TEST_RATIO, TRAIN_RATIO, VAL_RATIO
 
 PROJECT_DIR = Path(__file__).parent
@@ -146,21 +147,8 @@ def _is_overall_row(df: pd.DataFrame) -> pd.Series:
 
 
 def aggregate_model_comparison(df: pd.DataFrame, scope_suffix: str = "") -> pd.DataFrame:
-    """Aggregate overall metrics for LSTM and simple baselines across runs."""
-    overall_scope = "overall" if not scope_suffix else f"{scope_suffix}_overall"
-    baseline_persistence = (
-        "baseline_persistence" if not scope_suffix else f"{scope_suffix}_baseline_persistence"
-    )
-    baseline_seasonal = (
-        "baseline_seasonal_naive"
-        if not scope_suffix
-        else f"{scope_suffix}_baseline_seasonal_naive"
-    )
-    model_specs = [
-        ("CrowdLSTM", overall_scope),
-        ("Persistence (t-1)", baseline_persistence),
-        ("Seasonal Naive (t-24)", baseline_seasonal),
-    ]
+    """Aggregate overall metrics for LSTM and all baselines across runs."""
+    model_specs = get_model_comparison_specs(scope_suffix)
     rows: list[dict] = []
     for model_name, scope in model_specs:
         sub = df[(df["scope"] == scope) & _is_overall_row(df)]
@@ -177,21 +165,8 @@ def aggregate_model_comparison(df: pd.DataFrame, scope_suffix: str = "") -> pd.D
 
 def aggregate_baseline_per_station(df: pd.DataFrame, scope_suffix: str = "") -> pd.DataFrame:
     """Per-station MAE/RMSE/MAPE for LSTM vs baselines."""
-    station_scope = "station" if not scope_suffix else f"{scope_suffix}_station"
-    baseline_persistence = (
-        "baseline_persistence" if not scope_suffix else f"{scope_suffix}_baseline_persistence"
-    )
-    baseline_seasonal = (
-        "baseline_seasonal_naive"
-        if not scope_suffix
-        else f"{scope_suffix}_baseline_seasonal_naive"
-    )
+    specs = get_baseline_per_station_specs(scope_suffix)
     rows: list[dict] = []
-    specs = [
-        ("CrowdLSTM", station_scope),
-        ("Persistence (t-1)", baseline_persistence),
-        ("Seasonal Naive (t-24)", baseline_seasonal),
-    ]
     for station in STATION_NAMES:
         for model_name, scope in specs:
             sub = df[(df["scope"] == scope) & (df["station_name"] == station)]
@@ -225,7 +200,7 @@ def build_report(
         lines.append(title)
         lines.append("-" * w)
 
-    lines.append("EXPERIMENT REPORT (CrowdLSTM + Simple Baselines)")
+    lines.append("EXPERIMENT REPORT (CrowdLSTM + Baselines)")
     lines.append(f"Runs: {len(SEEDS)} | Seeds: {', '.join(map(str, SEEDS))}")
     lines.append(
         f"Temporal split: train {TRAIN_RATIO:.0%} | val {VAL_RATIO:.0%} | test {TEST_RATIO:.0%}"
